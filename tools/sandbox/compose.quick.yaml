@@ -1,0 +1,35 @@
+# Quick-path — fast functionality/interop checks WITHOUT spinning up a VM.
+#
+# `sandbox` runs the Tier-1 image with the repo bind-mounted; `dind` is a
+# throwaway Docker-in-Docker daemon so checks that need a daemon (e.g.
+# `docker compose config`) work too. This is convergence-LITE: good for "does it
+# interoperate" checks. Checks that need a full VM belong in the Tier-2 VM.
+#
+# Usage (from repo root):
+#   docker compose -f tools/sandbox/compose.quick.yaml up -d
+#   docker compose -f tools/sandbox/compose.quick.yaml exec sandbox bash
+#     # inside: run the project's checks, e.g. bash tests/run.sh
+#   docker compose -f tools/sandbox/compose.quick.yaml down -v
+#
+# NOTE: `dind` is privileged — that is inherent to running a Docker daemon in a
+# container. It is isolated from the host daemon.
+services:
+  dind:
+    image: docker:27-dind
+    privileged: true
+    environment:
+      DOCKER_TLS_CERTDIR: ""
+    command: ["--host=tcp://0.0.0.0:2375"]
+
+  sandbox:
+    build:
+      context: ../..
+      dockerfile: tools/sandbox/Dockerfile
+    working_dir: /work
+    volumes:
+      - ../..:/work
+    environment:
+      DOCKER_HOST: tcp://dind:2375
+    depends_on:
+      - dind
+    command: ["sleep", "infinity"]

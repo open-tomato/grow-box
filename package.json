@@ -1,0 +1,11 @@
+{
+  "name": "@open-tomato/grow-box",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Grow Box: sandboxes for checking a project's code in isolation",
+  "license": "Apache-2.0",
+  "scripts": {
+    "test": "bash tests/run.sh",
+    "privacy": "bun scripts/privacy-check.ts ."
+  }
+}

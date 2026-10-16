@@ -1,0 +1,113 @@
+#cloud-config
+# Tier 2 — convergence VM. Provisions a throwaway Ubuntu host with its own Docker
+# daemon, so a project's checks run on a real host without touching any other
+# machine. It is a plain cloud-init recipe, so a cloud provider can consume it too.
+#
+# Driven by tools/sandbox/launch-vm.sh, which:
+#   1. provisions read-only GitHub deploy keys (or an opt-in token fallback) on the HOST,
+#   2. stages provision.sh + setup-repos.sh + .bun-version + the secrets into a
+#      stable per-VM dir, and
+#   3. mounts that dir at /run/sandbox-secrets AFTER launch, then
+#   4. EXECS the bootstrap (`multipass exec ... sandbox-bootstrap.sh`) once the
+#      mount is guaranteed present.
+#
+# IMPORTANT — cloud-init does NOT run the bootstrap, because a first-boot `runcmd`
+# would race the `multipass mount` (launch can block on cloud-init while cloud-init
+# polls for a mount that only happens after launch returns — a timing deadlock). So this file's
+# only jobs are: install base packages, lay down the bun PATH profile, write the
+# bootstrap script to /usr/local/sbin, and add `ubuntu` to the docker group. The
+# bootstrap itself is DRIVEN by launch-vm.sh after the mount lands. Re-running
+# launch-vm.sh re-stages the scripts and re-execs the bootstrap, so the VM
+# converges on every run (resumable after a partial failure or a script update).
+#
+# The mount is what makes the scripts available before any repo is cloned — there
+# is no inline copy of the scripts here, so they never drift from the repo files.
+# sandbox-bootstrap.sh keeps a short mount-wait as belt-and-suspenders, but because
+# launch-vm.sh only execs it after the mount is confirmed, it does not race.
+package_update: true
+packages:
+  - curl
+  - ca-certificates
+  - git
+  - openssh-client
+
+write_files:
+  # Throwaway-sandbox marker. Its PRESENCE says this host is a disposable Grow Box
+  # VM, so a tool that must never run on a long-lived host can refuse unless the
+  # file exists. Dropped here, in cloud-init write_files, because that runs as
+  # root on the Tier-2 VM ONLY and never touches any other runtime.
+  - path: /etc/grow-box-sandbox
+    permissions: '0644'
+    content: |
+      This host is a THROWAWAY Grow Box sandbox (Tier-2 convergence VM).
+      Provisioned by tools/sandbox/ (cloud-init + launch-vm.sh). Safe to destroy.
+      Never create this file on a long-lived host.
+
+  - path: /etc/profile.d/bun-path.sh
+    permissions: '0644'
+    content: |
+      export PATH="$HOME/.bun/bin:$PATH"
+
+  - path: /usr/local/sbin/sandbox-bootstrap.sh
+    permissions: '0755'
+    content: |
+      #!/usr/bin/env bash
+      # Driven by launch-vm.sh via `multipass exec <vm> -- sudo bash THIS` AFTER
+      # the secrets mount is confirmed present. NOT run by cloud-init runcmd (it
+      # would race the mount). Idempotent and re-runnable: it re-copies the staged
+      # scripts and re-runs the privilege phases, so a re-run converges and
+      # propagates updated repo scripts.
+      #
+      # Phases: rebuild the tools/sandbox layout from the mount, run
+      # `provision.sh system` as root, then `provision.sh user` + `setup-repos.sh`
+      # as ubuntu. Each phase prints a [phase] marker; on failure the failing
+      # phase is named and the script exits non-zero so launch-vm.sh can tell the
+      # operator to just re-run launch-vm.sh to resume.
+      set -uo pipefail
+      MOUNT=/run/sandbox-secrets
+      DEST=/opt/sandbox-bootstrap
+      log()  { printf '[sandbox-bootstrap] %s\n' "$*"; }
+      fail() { printf '[sandbox-bootstrap] PHASE FAILED: %s\n' "$*" >&2; exit 1; }
+
+      # Belt-and-suspenders mount-wait. launch-vm.sh only execs us after the mount
+      # is confirmed, so this normally returns on the first iteration.
+      for _ in $(seq 1 60); do
+        [ -f "$MOUNT/provision.sh" ] && break
+        log "waiting for $MOUNT (mount not ready yet)"
+        sleep 5
+      done
+      if [ ! -f "$MOUNT/provision.sh" ]; then
+        fail "mount ($MOUNT/provision.sh never appeared — did 'multipass mount' run?)"
+      fi
+
+      # Reconstruct tools/sandbox/ so provision.sh's ../.bun-version read works.
+      # Always re-copy so updated staged scripts propagate on re-run.
+      log "phase: stage scripts -> $DEST"
+      mkdir -p "$DEST/tools/sandbox" || fail "stage (mkdir $DEST)"
+      cp "$MOUNT/provision.sh"   "$DEST/tools/sandbox/provision.sh"   || fail "stage (copy provision.sh)"
+      cp "$MOUNT/setup-repos.sh" "$DEST/tools/sandbox/setup-repos.sh" || fail "stage (copy setup-repos.sh)"
+      if [ -f "$MOUNT/.bun-version" ]; then
+        cp "$MOUNT/.bun-version" "$DEST/tools/.bun-version" || fail "stage (copy .bun-version)"
+      fi
+      chmod +x "$DEST/tools/sandbox/provision.sh" "$DEST/tools/sandbox/setup-repos.sh" || fail "stage (chmod)"
+      chown -R ubuntu:ubuntu "$DEST" || fail "stage (chown)"
+
+      # 1) Privileged system stage (root). provision.sh is `have`-guarded, so a
+      #    re-run only installs what is missing.
+      log "phase: provision.sh system (root)"
+      bash "$DEST/tools/sandbox/provision.sh" system || fail "provision.sh system"
+
+      # 2) Unprivileged per-user stages as the ubuntu user (bun -> ~ubuntu/.bun).
+      log "phase: provision.sh user (ubuntu)"
+      su - ubuntu -c "bash $DEST/tools/sandbox/provision.sh user" || fail "provision.sh user"
+      log "phase: setup-repos.sh (ubuntu)"
+      su - ubuntu -c "SANDBOX_SECRETS_DIR=$MOUNT bash $DEST/tools/sandbox/setup-repos.sh" || fail "setup-repos.sh"
+
+      log "bootstrap complete"
+
+runcmd:
+  # Let the default user drive docker without sudo (sandbox convenience only).
+  # The bootstrap is NOT run here — launch-vm.sh execs it after the mount lands.
+  - [ usermod, -aG, docker, ubuntu ]
+
+final_message: "Grow Box sandbox VM booted (base packages + docker group). launch-vm.sh now mounts secrets and execs sandbox-bootstrap.sh to provision + clone repos, then runs SANDBOX_RUN_CMD if set."
