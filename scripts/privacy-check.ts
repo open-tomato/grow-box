@@ -51,8 +51,6 @@ const EXIT_FAILED = 2;
 const BINARY_SNIFF_BYTES = 8000;
 const SKIPPED_DIRS = new Set(['.git', 'node_modules']);
 const IMAGE_FILE = /\.(png|jpe?g)$/i;
-const PNG_TEXT_CHUNKS = new Set(['tEXt', 'iTXt', 'zTXt', 'eXIf']);
-const JPEG_APP1 = 0xe1;
 
 export const ALLOWED_EMAILS: readonly string[] = ['marcostomatti.cv@gmail.com'];
 const ALLOWED_EMAIL_DOMAINS = /@(example\.(com|org|net)|users\.noreply\.github\.com)$/i;
@@ -66,9 +64,9 @@ const PRIVATE_PREFIX = `(?:10\\.${OCTET}|172\\.(?:1[6-9]|2\\d|3[01])|192\\.168|1
 
 export const GENERIC_RULES: readonly Rule[] = [
   { label: 'private-ip', pattern: new RegExp(`(?<![\\d.])${PRIVATE_PREFIX}\\.${OCTET}\\.${OCTET}(?!\\d)`, 'g') },
-  { label: 'home-path', pattern: /\/(?:Users|home)\/(?!(?:tester|user|runner)(?![\w.-]))[A-Za-z0-9._-]+/g },
+  { label: 'home-path', pattern: /(?:\\?\/(?:Users|home)\\?\/|[A-Za-z]:\\{1,2}Users\\{1,2})(?!(?:tester|user|runner)(?![\w.-]))[A-Za-z0-9._-]+/g },
   { label: 'email', pattern: /[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g, allow: allowedEmail },
-  { label: 'telegram-token', pattern: /(?<![\dA-Za-z])\d{8,10}:[A-Za-z0-9_-]{35}(?![A-Za-z0-9_-])/g },
+  { label: 'telegram-token', pattern: /(?<!\d)\d{8,10}:[A-Za-z0-9_-]{35}(?![A-Za-z0-9_-])/g },
   { label: 'telegram-chat', pattern: /(?<!\d)-100\d{9,}/g },
 ];
 
@@ -100,20 +98,33 @@ export function scanText(file: string, text: string, rules: readonly Rule[]): re
   );
 }
 
-function pngHasText(bytes: Uint8Array): boolean {
+/** PNG chunks that carry pixels and colour only; any other chunk may carry text. */
+const PNG_SAFE_CHUNKS = new Set(['IHDR', 'PLTE', 'IDAT', 'IEND', 'tRNS', 'gAMA', 'cHRM', 'sRGB', 'pHYs', 'bKGD']);
+/** JPEG segments before the scan that carry image data only (APP0 JFIF, APP14 Adobe, tables, frame headers). */
+const JPEG_SAFE_MARKERS = new Set([0xe0, 0xee, 0xdb, 0xc4, 0xdd, 0xc0, 0xc1, 0xc2, 0xc3, 0xc5, 0xc6, 0xc7, 0xc9, 0xca, 0xcb, 0xcd, 0xce, 0xcf]);
+const JPEG_START_OF_SCAN = 0xda;
+
+/** True when the PNG holds only safe chunks, ends at IEND and has nothing after it. */
+function pngIsClean(bytes: Uint8Array): boolean {
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-  for (let at = 8; at + 8 <= bytes.length; at += 12 + view.getUint32(at)) {
+  for (let at = 8; at + 12 <= bytes.length; ) {
+    const length = view.getUint32(at);
     const type = new TextDecoder().decode(bytes.subarray(at + 4, at + 8));
-    if (PNG_TEXT_CHUNKS.has(type)) return true;
+    if (!PNG_SAFE_CHUNKS.has(type)) return false;
+    const next = at + 12 + length;
+    if (type === 'IEND') return next === bytes.length;
+    at = next;
   }
   return false;
 }
 
-function jpegHasApp1(bytes: Uint8Array): boolean {
-  for (let at = 2; at + 4 <= bytes.length && bytes[at] === 0xff; ) {
+/** True when every segment before the scan is a safe one, with no fill bytes or stray data between them. */
+function jpegIsClean(bytes: Uint8Array): boolean {
+  for (let at = 2; at + 4 <= bytes.length; ) {
+    if (bytes[at] !== 0xff) return false;
     const marker = bytes[at + 1]!;
-    if (marker === JPEG_APP1) return true;
-    if (marker === 0xd9 || marker === 0xda) return false;
+    if (marker === JPEG_START_OF_SCAN) return true;
+    if (!JPEG_SAFE_MARKERS.has(marker)) return false;
     at += 2 + ((bytes[at + 2]! << 8) | bytes[at + 3]!);
   }
   return false;
@@ -123,9 +134,9 @@ const isPng = (bytes: Uint8Array): boolean => bytes[0] === 0x89 && bytes[1] === 
 const isJpeg = (bytes: Uint8Array): boolean => bytes[0] === 0xff && bytes[1] === 0xd8;
 const isImage = (bytes: Uint8Array): boolean => isPng(bytes) || isJpeg(bytes);
 
-/** A PNG text chunk or a JPEG APP1 (Exif, XMP) segment is one finding for the file. */
+/** An image holding anything beyond pixel and colour data (text, Exif, XMP, IPTC, comments, trailing bytes) is one finding. */
 export function imageMetadata(file: string, bytes: Uint8Array): readonly Finding[] {
-  const found = (isPng(bytes) && pngHasText(bytes)) || (isJpeg(bytes) && jpegHasApp1(bytes));
+  const found = (isPng(bytes) && !pngIsClean(bytes)) || (isJpeg(bytes) && !jpegIsClean(bytes));
   return found ? [{ file, line: 0, rule: 'image-metadata' }] : [];
 }
 
@@ -145,10 +156,10 @@ export async function scanDir(dir: string, rules: readonly Rule[], reviewed: Rev
     const file = relative(dir, path);
     if (link) return [{ file, line: 0, rule: 'symlink-unreviewed' }];
     const bytes = new Uint8Array(readFileSync(path));
+    const binary = bytes.subarray(0, BINARY_SNIFF_BYTES).includes(0);
+    if ((binary || isImage(bytes)) && reviewed.get(file) === sha256(bytes)) return [];
     if (IMAGE_FILE.test(file) && isImage(bytes)) return imageMetadata(file, bytes);
-    if (bytes.subarray(0, BINARY_SNIFF_BYTES).includes(0)) {
-      return reviewed.get(file) === sha256(bytes) ? [] : [{ file, line: 0, rule: 'binary-unreviewed' }];
-    }
+    if (binary) return [{ file, line: 0, rule: 'binary-unreviewed' }];
     return scanText(file, new TextDecoder().decode(bytes), rules);
   });
 }

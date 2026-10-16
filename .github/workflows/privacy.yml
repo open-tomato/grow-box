@@ -29,5 +29,20 @@ jobs:
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
       - name: Scan the files
         run: bun scripts/privacy-check.ts .
-      - name: Scan the history
+      - name: Scan the history for secrets
         run: gitleaks git --redact --no-banner .
+      - name: Scan every new commit
+        shell: bash
+        env:
+          BEFORE: ${{ github.event.before }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          if [ -n "${PR_BASE:-}" ]; then
+            range="$PR_BASE..HEAD"
+          elif [ -n "${BEFORE:-}" ] && git cat-file -e "$BEFORE^{commit}" 2>/dev/null; then
+            range="$BEFORE..HEAD"
+          else
+            range="HEAD"
+          fi
+          bash scripts/privacy-history.sh "$range"
